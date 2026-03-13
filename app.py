@@ -6,10 +6,8 @@ import uuid
 from pathlib import Path
 import logging
 import datetime
-import mysql.connector
-from mysql.connector import Error
+from db import get_db_connection
 
-# Configuración básica
 app = Flask(__name__)
 CORS(app)
 
@@ -17,48 +15,28 @@ CORS(app)
 def home():
     return render_template("index.html")
 
-# Directorios
-BASE_DIR = Path(__file__).parent.absolute()
+BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
 
-# Configuración
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
+app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# Crear directorio de uploads si no existe
-UPLOAD_FOLDER.mkdir(exist_ok=True)
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 
-# Inicializar el modelo (¡SOLO UNA VEZ!)
+MODEL_VERSION = os.getenv("MODEL_VERSION", "plantdoc_300_epochs3")
+
 detector = PlantDiseaseDetector(
     model_path=BASE_DIR,
-    model_version='plantdoc_300_epochs3'
+    model_version=MODEL_VERSION
 )
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Configuración de la base de datos 
-DB_CONFIG = {
-    'host': '127.0.0.1',  
-    'port': 3306,         
-    'database': 'LOTUS',
-    'user': 'root',
-    'password': ''
-}
-
-#Coneccion de la base de datos 
-def get_db_connection():
-    try:
-        connection = mysql.connector.connect(**DB_CONFIG)
-        return connection
-    except Error as e:
-        print(f"Error connecting to MySQL: {e}")
-        return None
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -76,29 +54,25 @@ def predict():
             'message': 'Tipo de archivo no permitido',
             'allowed_types': list(ALLOWED_EXTENSIONS)
         }), 400
+
+    filepath = None
     
     try:
-        # Guardar archivo temporal
         file_ext = file.filename.rsplit('.', 1)[1].lower()
         filename = f"{uuid.uuid4()}.{file_ext}"
         filepath = UPLOAD_FOLDER / filename
         file.save(filepath)
         logger.info(f"Imagen guardada temporalmente en: {filepath}")
         
-        # Procesar imagen
         results = detector.detect(str(filepath))
         
-        # Eliminar archivo temporal
-        filepath.unlink()
-        
-        # Formatear respuesta
         response = {
             'status': results.get('status', 'success'),
             'data': {
                 'detections': results.get('detections', []),
                 'image_info': {
                     'original_size': results.get('image_size'),
-                    'processed_size': (640, 640)
+                    'processed_size': [640, 640]
                 },
                 'model_info': results.get('model_info', {})
             },
@@ -109,23 +83,24 @@ def predict():
         
     except Exception as e:
         logger.error(f"Error en /predict: {str(e)}", exc_info=True)
-        # Limpieza en caso de error
-        if 'filepath' in locals() and filepath.exists():
-            filepath.unlink()
         return jsonify({
             'status': 'error',
             'message': 'Error procesando imagen',
             'details': str(e)
         }), 500
 
+    finally:
+        if filepath and filepath.exists():
+            filepath.unlink()
+
+
 @app.route('/model-info', methods=['GET'])
 def model_info():
-    """Endpoint para obtener información del modelo"""
     return jsonify({
         'status': 'success',
         'model': {
             'name': 'YOLOv7',
-            'version': 'pplantdoc_300_epochs3',
+            'version': MODEL_VERSION,
             'classes': detector.class_names,
             'device': detector.device
         }
@@ -139,23 +114,21 @@ def disease_info():
     if not class_name:
         return jsonify({'status': 'error', 'message': 'Parámetro class requerido'}), 400
     
+    connection = None
+    cursor = None
+    
     try:
         connection = get_db_connection()
         if not connection:
             return jsonify({'status': 'error', 'message': 'Error de conexión a la base de datos'}), 500
         
-        cursor = connection.cursor(dictionary=True)
+        cursor = connection.cursor()
         query = "SELECT * FROM plantas WHERE clases = %s"
         cursor.execute(query, (class_name,))
         result = cursor.fetchone()
         
-        cursor.close()
-        connection.close()
-        
         if result:
-            # Extrae solo el nombre del archivo de la ruta completa
-            import os
-            filename = os.path.basename(result['foto'])
+            filename = os.path.basename(result['foto']) if result.get('foto') else None
             
             return jsonify({
                 'status': 'success',
@@ -164,14 +137,21 @@ def disease_info():
                     'clases_e': result['clases_e'],
                     'descripcion': result['descripcion'],
                     'solucion': result['solucion'],
-                    'foto': filename  # Solo el nombre del archivo
+                    'foto': filename
                 }
             })
         else:
             return jsonify({'status': 'error', 'message': 'Enfermedad no encontrada'}), 404
             
-    except Error as e:
+    except Exception as e:
         return jsonify({'status': 'error', 'message': f'Error de base de datos: {str(e)}'}), 500
     
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+    
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
