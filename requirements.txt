@@ -14,3 +14,4 @@ matplotlib
 tqdm
 pandas
 seaborn
+psycopg2-binary
